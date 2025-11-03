@@ -101,14 +101,14 @@ def create_vessel_trajectory_df(id_ship, trajs, overlap_idx, vessel_ids):
 if __name__ == '__main__':
     plan_start_time = 0
     plan_end_time = 24  
-    region_of_interest = {"LON": (103.82, 103.88), "LAT": (1.15, 1.22)}
+    region_of_interest = {"LON": (-94.85, -94.68), "LAT": (29.32, 29.39)}
     region_of_interest_array = np.array([list(region_of_interest[k]) for k in ["LON", "LAT"]]).T
     print(region_of_interest_array)
     from split_chunks import seperate_chunks
     # Read static data from multiple files
     data_folder = "./raw_data/"
     # Read position data from multiple files
-    position_file_pattern = data_folder+"synthetic_ais_data.csv"
+    position_file_pattern = data_folder+"shipnavisim_input.csv"
     df = read_position_data(position_file_pattern)          
     geo_filters = [(v[0] <= pl.col(k)) & (pl.col(k) <= v[1]) for k, v in region_of_interest.items()]     
     # Create time filter for planning horizon (7:00 AM to 9:00 AM)    
@@ -131,17 +131,27 @@ if __name__ == '__main__':
     print(chunks.describe())    
     chunks = chunks.sort('start_time')
     print(chunks[:10])
-    num_ships = len(chunks)       
-    trajs = []    
+    # Build trajectories and times, but skip any chunk that results in an empty
+    # interpolated time vector (this avoids IndexError when accessing [0]/[-1]).
+    num_chunks = len(chunks)
+    trajs = []
     times = []
     tw_lst = []
     vessel_ids = []
-    for j in range(num_ships):      
-        traj, time = chunk_to_traj(chunks[j], inter_pol, region_of_interest_array)             
+    # Keep mapping from trajectory index -> original chunk index for later metadata lookups
+    chunk_indices = []
+    for j in range(num_chunks):
+        traj, time = chunk_to_traj(chunks[j], inter_pol, region_of_interest_array)
+        # Skip empty results
+        if time is None or len(time) == 0 or traj is None or len(traj) == 0:
+            continue
         vessel_ids.append(chunks[j]["SHIP_ID"][0])
-        trajs.append(traj)        
+        trajs.append(traj)
         times.append(time)
-        tw_lst.append((times[-1][0], times[-1][-1]))        
+        tw_lst.append((time[0], time[-1]))
+        chunk_indices.append(j)
+    if len(trajs) == 0:
+        raise RuntimeError("No valid trajectories after interpolation; check data and filters.")
     overlap_idx = utils.find_overlapping_intervals(tw_lst)
     
     #Create environment
@@ -149,24 +159,47 @@ if __name__ == '__main__':
     env = ShipEnvironment(trajs, times, overlap_idx, region_of_interest, n_neighbor_agents=10) 
     
     #Render 
-    env = gym.wrappers.RecordVideo(env, "tmp/video-1.mp4")
-    env.metadata['render_fps'] = 10    
-    replay_ship_env(id_ship=0, env=env, render=True)    
+    # env = gym.wrappers.RecordVideo(env, "tmp/video-1.mp4")
+    # env.metadata['render_fps'] = 10    
+    replay_ship_env(id_ship=0, env=env, render=False)    
     
     #Create minari dataset for IL
     # Uncomment for creating offline dataset. Note that, we only need to create dataset once.
-    create_minari_dataset(env, dataset_name="Maritime-Expert-v1",num_ships=num_ships)
+    # Update num_ships to the number of valid trajectories we actually included
+    num_ships = len(trajs)
+    
+    # Delete old dataset if it exists to ensure we create a fresh one with the fix
+    dataset_name = "Maritime-Expert-Bolivar-Roads-2022_2024-v2"
+    try:
+        minari.delete_dataset(dataset_name)
+        print(f"Deleted existing dataset: {dataset_name}")
+    except Exception as e:
+        print(f"No existing dataset to delete or error: {e}")
+    
+    # Create the dataset
+    create_minari_dataset(env, dataset_name=dataset_name, num_ships=num_ships)
     
     #Load dataset 
-    dataset = minari.load_dataset("Maritime-Expert-v1")
-
-    for episode_data in dataset.iterate_episodes():
+    dataset = minari.load_dataset("Maritime-Expert-Bolivar-Roads-2022_2024-v2")
+    
+    # Validate the dataset to ensure observations = actions + 1 for each episode
+    print("\nValidating dataset...")
+    for i, episode_data in enumerate(dataset.iterate_episodes()):
         observations = episode_data.observations
         actions = episode_data.actions
         rewards = episode_data.rewards
         terminations = episode_data.terminations
         truncations = episode_data.truncations
         infos = episode_data.infos
+        
+        # Check the relationship
+        num_obs = len(observations['ego']) if isinstance(observations, dict) else len(observations)
+        num_actions = len(actions)
+        if num_obs != num_actions + 1:
+            print(f"WARNING: Episode {i} has {num_obs} observations but {num_actions} actions (expected {num_actions + 1} observations)")
+        else:
+            print(f"Episode {i}: ✓ {num_obs} observations, {num_actions} actions")
+
         
     #Compute metrics for all expert trajs:
     lst_infos = []
@@ -175,8 +208,10 @@ if __name__ == '__main__':
         val = replay_ship_env(id_ship, env)
         if(val is None):
             continue
-        val["ship_id"] = chunks[id_ship]["SHIP_ID"][0]
-        val["start_time"] = chunks[id_ship]["start_time"][0]
+        # Map back to the original chunk to get metadata (SHIP_ID, start_time)
+        orig_idx = chunk_indices[id_ship]
+        val["ship_id"] = chunks[orig_idx]["SHIP_ID"][0]
+        val["start_time"] = chunks[orig_idx]["start_time"][0]
         lst_infos.append(val)
     df_exp_infos = pd.DataFrame(lst_infos)
     df_exp_infos.drop(["CPD"], axis=1, inplace=True)

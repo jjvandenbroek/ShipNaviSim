@@ -9,14 +9,152 @@ from collections import deque
 from pygame import gfxdraw
 
 class ShipEnvironment(gym.Env):
+    """
+    Gymnasium environment for ship navigation based on real AIS trajectory data.
+    
+    ============================================================================
+    EPISODE GENERATION OVERVIEW - HOW DATASET EPISODES ARE CREATED:
+    ============================================================================
+    
+    The episodes in your dataset come from REAL RECORDED SHIP TRAJECTORIES.
+    Each episode represents one ship's complete journey from its starting position
+    to its destination, extracted from historical AIS (Automatic Identification System) data.
+    
+    STEP 1: DATA PREPROCESSING (chunk_to_traj function)
+    ---------------------------------------------------
+    Raw AIS data → Clean, interpolated trajectories
+    
+    - Input: Sparse, irregular AIS position reports (lat/lon, speed, heading)
+    - Process:
+      * Convert geographic coordinates (lat/lon) to local Cartesian (x/y meters)
+      * Convert units (knots→m/s, compass degrees→radians)
+      * Interpolate onto regular time grid (e.g., every 10 seconds)
+      * Use Haversine distance for accurate lat/lon→meter conversion
+    - Output: Array of states [x, y, speed, heading] at regular intervals
+    
+    STEP 2: EPISODE INITIALIZATION (reset method)
+    ----------------------------------------------
+    Select one ship trajectory to become an "episode"
+    
+    - Choose ego ship: Select one trajectory as the agent to control/observe
+    - Set starting state: First recorded position becomes initial state
+    - Set goal: Last recorded position becomes target destination
+    - Identify neighbors: Find all ships whose trajectories overlap in time
+    - Generate expert actions: Calculate (dx, dy, dheading) from consecutive states
+    - Validate: Reject trajectories with erratic movements (too large jumps/turns)
+    
+    STEP 3: EXPERT ACTION EXTRACTION (gen_actions_from_data, infer_action_from_trajectory)
+    ---------------------------------------------------------------------------------------
+    Convert recorded trajectory into sequence of actions
+    
+    For each consecutive pair of states (t, t+1):
+    - Calculate: dx = x[t+1] - x[t], dy = y[t+1] - y[t]
+    - Calculate: dheading = heading[t+1] - heading[t] (shortest angle)
+    - Validate: Ensure changes are within physical bounds:
+      * |dx|, |dy| < 5% of environment size (not teleporting)
+      * |dheading| < 90° (no sudden spin)
+    - If any action invalid → reject entire trajectory
+    - Scale to action space range (e.g., [-1, 1] if normalized)
+    
+    STEP 4: OBSERVATION CONSTRUCTION (_get_observation method)
+    -----------------------------------------------------------
+    Build observation showing ego state + nearby ships
+    
+    At each timestep:
+    - Ego observation: Sliding window of last N states [x, y, speed, heading, drift]
+    - Find neighbors: Query all ships active at current timestamp
+    - Calculate distances: Euclidean distance from ego to each neighbor
+    - Select nearest N: Sort by distance, keep closest neighbors
+    - Extract histories: For each neighbor, get their last N states
+    - Pad if needed: If fewer than N neighbors, pad with zeros
+    - Optional: Transform to ego's frame of reference (relative positions)
+    
+    STEP 5: EPISODE ROLLOUT (create_minari_dataset function)
+    ---------------------------------------------------------
+    Execute trajectory and record transitions
+    
+    For each valid ship trajectory:
+    - Reset environment with this ship as ego
+    - Loop through pre-computed expert actions:
+      * Execute action in environment
+      * Record transition: (observation, action, reward, next_observation)
+      * Update ego state according to action
+      * Update neighbor observations (they follow their real trajectories)
+      * Check termination: goal reached or boundary violated
+    - Save episode to Minari dataset
+    
+    ============================================================================
+    KEY INSIGHT: EXPERT DEMONSTRATIONS
+    ============================================================================
+    
+    Your dataset contains IMITATION LEARNING data:
+    - States: What the ship observed (own state + neighbors)
+    - Actions: What the real ship captain actually did
+    - This is "expert behavior" extracted from real navigation data
+    - Agents can learn by imitating these expert demonstrations (Behavioral Cloning)
+    
+    WHAT MAKES AN EPISODE "VALID":
+    - Complete trajectory (start to end)
+    - Smooth movements (no erratic jumps)
+    - Within bounds (stays in region of interest)
+    - Physically plausible (speed/turn changes are realistic)
+    
+    ============================================================================
+    """
     def __init__(self, ship_trajectories, ship_times, overlap_idx, region_of_interest,
                  ego_pos: int = 0, observation_history_length: int = 10, n_neighbor_agents: int = 5, render_histL: int = 1000,
                  normalize_xy: bool = False, max_steps: int = 1000, second_perts = 10, use_time_fea=False,
                  drop_neighbor=False, use_dis_fea=False, use_drift_fea=False, use_FoR = False, scale_act=False):
-        super(ShipEnvironment, self).__init__()        
-        self.ship_trajectories = ship_trajectories
-        self.ship_times = ship_times
-        self.overlap_idx = overlap_idx
+        """
+        Initialize the ship navigation environment with preprocessed trajectory data.
+        
+        KEY DATA STRUCTURES FOR EPISODE GENERATION:
+        
+        ship_trajectories: List[np.ndarray]
+            - One array per ship containing its complete trajectory
+            - Each trajectory: array of shape (n_timesteps, 4 or 5)
+            - Columns: [x_meters, y_meters, speed_m/s, heading_radians, (drift_radians)]
+            - These are the "expert demonstrations" - real recorded ship movements
+            - Episodes are generated by selecting one trajectory as ego agent
+        
+        ship_times: List[np.ndarray]
+            - One array per ship with Unix timestamps for each state
+            - Parallel to ship_trajectories: ship_times[i][j] is time of ship_trajectories[i][j]
+            - Used to synchronize observations (which ships are visible when)
+        
+        overlap_idx: Dict[int, List[int]]
+            - Maps each ship_id to list of ships that overlap in time
+            - overlap_idx[ego_id] gives all ships that could be neighbors in that episode
+            - Pre-computed for efficiency (avoids checking all ships every step)
+        
+        region_of_interest: Dict
+            - Geographic bounds: {'LON': [min_lon, max_lon], 'LAT': [min_lat, max_lat]}
+            - Defines the navigation area in lat/lon coordinates
+            - Converted to meters: origin at southwest corner
+        
+        EPISODE PARAMETERS:
+        
+        ego_pos: Which ship trajectory to use as the ego agent (index into ship_trajectories)
+        observation_history_length: How many past timesteps to include in observation
+        n_neighbor_agents: Maximum number of neighboring ships to observe
+        second_perts: Time interval between trajectory samples (seconds per timestep)
+        
+        OBSERVATION/ACTION SPACE PARAMETERS:
+        
+        normalize_xy: Whether to normalize positions to [-1, 1] range
+        scale_act: Whether actions are in [-1, 1] (True) or raw meters/radians (False)
+        use_drift_fea: Include drift angle (heading vs movement direction) in observations
+        use_FoR: Transform neighbor positions to ego's frame of reference
+        use_dis_fea: Include distances to neighbors in observation
+        use_time_fea: Include time encoding in observation
+        drop_neighbor: Exclude neighbor observations (ego-only navigation)
+        """
+        super(ShipEnvironment, self).__init__()
+        
+        # Store preprocessed trajectory data - these ARE the episodes
+        self.ship_trajectories = ship_trajectories  # The expert demonstrations
+        self.ship_times = ship_times                # Timestamps for temporal alignment
+        self.overlap_idx = overlap_idx              # Which ships can be neighbors
         self.region_of_interest = region_of_interest
         self.ego_pos = ego_pos
         self.observation_history_length = observation_history_length
@@ -257,44 +395,83 @@ class ShipEnvironment(gym.Env):
         return self.compute_dis_to_goal() < self.goal_threshold  
     
     def reset(self, seed=None, options=None):
+        """
+        Resets the environment to start a new episode.
+        
+        EPISODE INITIALIZATION PROCESS:
+        1. Selects which ship trajectory to use as the ego agent
+        2. Sets the starting state from the first recorded position
+        3. Sets the goal as the last recorded position  
+        4. Identifies overlapping neighbor ships in the temporal window
+        5. Pre-computes expert actions from the recorded trajectory
+        
+        Returns:
+            observation: Initial observation dict with ego state, neighbors, and goal
+            info: Dict containing goal_position and pre-computed expert actions
+        """
         super().reset(seed=seed)
         
+        # If options specify which ship to use as ego, update ego_pos
+        # This allows external control over which trajectory becomes the episode
         if options is not None and options.get('ego_pos', None) != None:
             self.ego_pos = options['ego_pos']
+        
+        # Reset step counter and metrics for the new episode
         self.current_step = 0
-        self.CPD = 0 #Reset Closest Point Distance
+        self.CPD = 0  # Closest Point Distance to nearest neighbor
         self.lastdheading = 0 
-        #Set new goal based on ego agent       
+        
+        # GOAL SETTING: Extract the final position from this ship's recorded trajectory
+        # The episode goal is to navigate from start to this end position
         final_state = self.ship_trajectories[self.ego_pos][-1]
-        self.goal_position = (final_state[0], final_state[1])
-        ego_goal_x, ego_goal_y = self.goal_position        
-        #Need to normalize due to its original
+        self.goal_position = (final_state[0], final_state[1])  # (x, y) in meters
+        ego_goal_x, ego_goal_y = self.goal_position
+        
+        # Normalize goal coordinates if using normalized observation space
         if self.normalize_xy:            
-            ego_goal_x = (ego_goal_x / self.max_x) * 2 - 1
-            ego_goal_y = (ego_goal_y / self.max_y) * 2 - 1    
+            ego_goal_x = (ego_goal_x / self.max_x) * 2 - 1  # Map [0, max_x] to [-1, 1]
+            ego_goal_y = (ego_goal_y / self.max_y) * 2 - 1  # Map [0, max_y] to [-1, 1]
+        
+        # Initialize observation dictionary structure
+        # 'ego': history of ego ship's states, 'neighbors': nearby ships, 'goal': target position
         self.current_obs = {'ego': None, 'neighbors': None, 'FoR_neigh':None, 'nearest_dis': None, 'goal': np.array([ego_goal_x, ego_goal_y])} 
         self.expert_obs = None
-        # Initialize current_state based on the first entry of ego ship's trajectory               
-        initial_state = self.ship_trajectories[self.ego_pos][0]     
-        initial_time = self.ship_times[self.ego_pos][0]
+        
+        # STARTING STATE: Extract the first position from this ship's recorded trajectory
+        # This becomes the initial state of the episode
+        initial_state = self.ship_trajectories[self.ego_pos][0]  # [x, y, speed, heading, (drift)]
+        initial_time = self.ship_times[self.ego_pos][0]  # Unix timestamp in seconds
+        
+        # Initialize ego observation history with padding
+        # History tracks past observations for temporal context
         self.current_obs['ego'] = np.array([self.padded_val]*(self.observation_history_length + 1))
-        self.current_obs['ego'][-1] = initial_state        
+        self.current_obs['ego'][-1] = initial_state  # Most recent observation is the starting state
+        
+        # Set the current state dictionary with all state variables
         self.current_state = {            
-            'x': initial_state[0],
-            'y': initial_state[1],
-            'speed': initial_state[2],
-            'heading': initial_state[3],
-            'timestamp': initial_time
-        }        
-        # Set goal_position based on the last entry of ego ship's trajectory                
-        self.total_neigh = 0
-        self.max_neigh = 0
-        self.save_past_ego = deque() #used for saving last ego states
-        self.save_past_exp = deque() #used for saving last exp states
-        observation = self._get_observation() #Change neighoring agents info
+            'x': initial_state[0],          # X position in meters
+            'y': initial_state[1],          # Y position in meters
+            'speed': initial_state[2],      # Speed in m/s
+            'heading': initial_state[3],    # Heading in radians
+            'timestamp': initial_time       # Unix timestamp
+        }
+        
+        # Initialize tracking variables for episode statistics
+        self.total_neigh = 0  # Total neighbor count across all steps
+        self.max_neigh = 0    # Maximum neighbors observed in any single step
+        self.save_past_ego = deque()  # Deque to store ego's trajectory for rendering
+        self.save_past_exp = deque()  # Deque to store expert trajectory for comparison
+        
+        # Get initial observation including neighboring ships at this timestamp
+        # This populates self.current_obs['neighbors'] with nearby ships
+        observation = self._get_observation()
+        
+        # EXPERT ACTION GENERATION: Extract actions from recorded trajectory
+        # These represent the "expert" behavior - what the real ship actually did
         self.exp_acclerations = []
-        self.exp_actions = self.gen_actions_from_data()               
-        # Initialize metric        
+        self.exp_actions = self.gen_actions_from_data()  # Returns None if trajectory has invalid movements
+        
+        # Initialize metrics for tracking episode performance
         self.total_speed = 0
         self.min_speed = float('inf')
         self.max_speed = float('-inf')
@@ -531,168 +708,295 @@ class ShipEnvironment(gym.Env):
         return observation, float(reward), terminated, truncated, return_info
     
     def _get_observation(self):
-        # self.ego_trajectory = self.ship_trajectories[self.ego_pos]
-        # Get current timestamp from ego trajectory
+        """
+        Constructs the observation for the current timestep.
+        
+        OBSERVATION CONSTRUCTION PROCESS:
+        1. Update ego ship's observation history with current state
+        2. Find all ships that overlap temporally with ego at current timestamp
+        3. Calculate distances to all overlapping ships
+        4. Select the N nearest neighbors
+        5. Extract observation histories for each neighbor
+        6. Pad if fewer than N neighbors exist
+        
+        Returns:
+            dict containing:
+                - 'ego': (history_len+1, features) array of ego's state history
+                - 'neighbors': (N, history_len+1, features) array of neighbor histories
+                - 'nearest_dis': (N,) array of distances to neighbors
+                - 'FoR_neigh': neighbors transformed to ego's frame of reference (if enabled)
+                - 'goal': (2,) array with goal position
+        """
+        # Get current timestamp from ego's state
         current_timestamp = self.current_state['timestamp']
 
-        # ego_obs = self._get_agent_observation(self.ego_trajectory, current_timestamp)
-        ego_obs = self.current_obs['ego'].copy()        
-        ego_obs = np.delete(ego_obs, 0, axis=0)#Remove the first element for consistent history length          
-        ego_obs = np.append(ego_obs, [self.padded_val], axis=0)        
-                
-        #Change ego_obs based on the current_state        
-        ego_obs[-1][0] = self.current_state['x']
-        ego_obs[-1][1] = self.current_state['y']
-        ego_obs[-1][2] = self.current_state['speed']
-        ego_obs[-1][3] = self.current_state['heading']                
+        # UPDATE EGO OBSERVATION: Maintain sliding window history
+        ego_obs = self.current_obs['ego'].copy()
+        ego_obs = np.delete(ego_obs, 0, axis=0)  # Remove oldest observation (slide window)
+        ego_obs = np.append(ego_obs, [self.padded_val], axis=0)  # Add placeholder for new observation
+        
+        # Populate current ego state from current_state dict
+        ego_obs[-1][0] = self.current_state['x']       # X position
+        ego_obs[-1][1] = self.current_state['y']       # Y position
+        ego_obs[-1][2] = self.current_state['speed']   # Speed
+        ego_obs[-1][3] = self.current_state['heading'] # Heading
+        
+        # Calculate drift angle if drift feature is enabled
         if self.use_drift_fea:            
             ego_obs[-1][4] = 0
+            # Drift = angle between heading and actual movement direction
             if np.array_equal(self.current_obs['ego'][-1], self.padded_val) is False:
                 past_x = self.current_obs['ego'][-1][0]
                 past_y = self.current_obs['ego'][-1][1]
                 ego_obs[-1][4] = utils.calculate_drift_two_points(past_x, past_y, ego_obs[-1][0], ego_obs[-1][1], ego_obs[-1][3])
-                                            
+        
+        # Save updated ego observation
         self.current_obs['ego']= ego_obs
-        # Get current ego position
-        ego_x, ego_y = ego_obs[-1][:2]  # Use the most recent observation       
+        
+        # Get current ego position for distance calculations
+        ego_x, ego_y = ego_obs[-1][:2]
 
-        # Calculate distances to all other agents at the current timestamp
+        # FIND NEIGHBORING SHIPS: Query all ships that temporally overlap with ego
         distances = []
-        for agent_id in self.overlap_idx[self.ego_pos]:
-            if agent_id != self.ego_pos:
+        for agent_id in self.overlap_idx[self.ego_pos]:  # overlap_idx contains ships in same time window
+            if agent_id != self.ego_pos:  # Don't include ego as its own neighbor
                 trajectory = self.ship_trajectories[agent_id]
                 time = self.ship_times[agent_id]
+                # Extract this neighbor's state at the current timestamp
                 agent_obs = self._get_agent_observation(trajectory, time, current_timestamp)
-                if np.array_equal(agent_obs[-1], self.padded_val) is False:  # Check if valid observation (not padded)
+                
+                # Check if neighbor has valid data at this timestamp (not padded)
+                if np.array_equal(agent_obs[-1], self.padded_val) is False:
                     agent_x, agent_y = agent_obs[-1][:2]
+                    # Calculate Euclidean distance to ego ship
                     distance = np.sqrt((ego_x - agent_x)**2 + (ego_y - agent_y)**2)
                     distances.append((agent_id, distance))
         
-        self.total_neigh += len(distances)
-        self.max_neigh = max(self.max_neigh, len(distances))
-        #Process exp obs:
+        # Track neighbor statistics for metrics
+        self.total_neigh += len(distances)  # Cumulative count across episode
+        self.max_neigh = max(self.max_neigh, len(distances))  # Max in any single step
+        
+        # UPDATE EXPERT OBSERVATION: Track where ego "should" be according to recorded data
+        # This is used for imitation learning comparison
         self.expert_obs = self._get_agent_observation(self.ship_trajectories[self.ego_pos], self.ship_times[self.ego_pos], current_timestamp)
         self.save_past_exp.appendleft(self.expert_obs[-1])
-        # Sort by distance and get the nearest n_neighbor_agents
+        
+        # NEIGHBOR SELECTION: Sort by distance and select nearest N ships
         distances.sort(key=lambda x: x[1])
         nearest_neighbors = distances[:self.n_neighbor_agents]
         
+        # Update CPD (Closest Point Distance) for collision risk metrics
         if (len(distances) != 0):
-            self.CPD = distances[0][1]
+            self.CPD = distances[0][1]  # Distance to nearest neighbor
         else:
-            self.CPD = 0
+            self.CPD = 0  # No neighbors present
+        
+        # EXTRACT NEIGHBOR OBSERVATIONS: Get state histories for selected neighbors
         neighbor_obs = []
         nearest_dis_obs = []
         for agent_id, dis in nearest_neighbors:
+            # Get observation history for this neighbor at current timestamp
             neighbor_obs.append(self._get_agent_observation(self.ship_trajectories[agent_id], 
                                                             self.ship_times[agent_id],
-                                                            current_timestamp))      
+                                                            current_timestamp))
             nearest_dis_obs.append(dis)
-        # Pad neighbor observations if necessary
+        
+        # PADDING: If fewer than N neighbors exist, pad with zeros
         while len(neighbor_obs) < self.n_neighbor_agents:
             neighbor_obs.append(self._get_padded_observation())
-            nearest_dis_obs.append(np.sqrt(self.max_x**2+self.max_y**2))
+            nearest_dis_obs.append(np.sqrt(self.max_x**2+self.max_y**2))  # Max possible distance
 
-        # for val in neighbor_obs:
-        #     print(val.dtype, val.shape)
-        self.current_obs['neighbors'] = np.array(neighbor_obs)            
-        if self.use_FoR:            
-            self.current_obs["FoR_neigh"] = utils.transform_neighbors_to_ego_frame(self.current_obs['ego'], self.current_obs['neighbors'])                               
+        # Convert to numpy arrays for efficient processing
+        self.current_obs['neighbors'] = np.array(neighbor_obs)
+        
+        # FRAME OF REFERENCE TRANSFORMATION: Convert neighbor positions to ego-centric coordinates
+        if self.use_FoR:
+            # Transform neighbor positions relative to ego's position and heading
+            self.current_obs["FoR_neigh"] = utils.transform_neighbors_to_ego_frame(self.current_obs['ego'], self.current_obs['neighbors'])
+        
         self.current_obs['nearest_dis'] = np.array(nearest_dis_obs, dtype=np.float32)
-        # self.current_obs['goal'] = np.array([ego_goal_x, ego_goal_y])
+        
         return self.current_obs    
 
     def _get_agent_observation(self, trajectory, time, target_timestamp):
+        """
+        Extracts observation history for a ship at a specific timestamp.
+        
+        OBSERVATION HISTORY EXTRACTION:
+        For a given ship and target timestamp:
+        1. Define time window: [target_timestamp - history_length*timestep, target_timestamp]
+        2. Find all recorded states within this window
+        3. Pad beginning if ship wasn't yet active
+        4. Extract state features (x, y, speed, heading, drift) for each timestep
+        5. Normalize coordinates if required
+        6. Pad end if not enough history exists
+        
+        This creates a temporal observation window showing where the ship has been.
+        
+        Args:
+            trajectory: Array of recorded states for this ship
+            time: Array of timestamps corresponding to trajectory states
+            target_timestamp: Unix timestamp for which to extract observation
+            
+        Returns:
+            numpy array of shape (history_length+1, features) containing state history
+        """
         obs = []
-        # Find the index of the target timestamp or the nearest earlier timestamp        
-        low_t = target_timestamp - self.observation_history_length*self.second_perts             
-        lst_ids = utils.find_indices_in_range_sorted(time, 
-                                                     low_t,
-                                                     target_timestamp)
+        
+        # Define the observation time window
+        # Look back (history_length * time_per_step) seconds from target
+        low_t = target_timestamp - self.observation_history_length*self.second_perts
+        
+        # Find all trajectory indices within the time window [low_t, target_timestamp]
+        # Uses binary search on sorted time array for efficiency
+        lst_ids = utils.find_indices_in_range_sorted(time, low_t, target_timestamp)
+        
         if(len(lst_ids) != 0):
-            # print(int((trajectory[lst_ids[0]][4] - low_t)/self.second_perts))
+            # PAD BEGINNING: If ship's trajectory starts after low_t, pad with zeros
+            # Calculate how many timesteps are missing at the start
             for i in np.arange(0, (time[lst_ids[0]] - low_t)/self.second_perts, dtype=int):
-                obs.append(self.padded_val)
-                
-            for i in lst_ids:       
-                if self.use_drift_fea is False:         
+                obs.append(self.padded_val)  # Add padded observation for missing timesteps
+            
+            # EXTRACT STATES: Add recorded states within the time window
+            for i in lst_ids:
+                # Unpack state features from trajectory
+                if self.use_drift_fea is False:
                     x, y, speed, heading = trajectory[i]
-                else: 
+                else:
                     x, y, speed, heading, drift = trajectory[i]
                 timestamp = time[i]
+                
+                # NORMALIZE COORDINATES: Convert to [-1, 1] range if enabled
                 if self.normalize_xy:
-                    x = (x / self.max_x) * 2 - 1
-                    y = (y / self.max_y) * 2 - 1
-                if self.use_drift_fea is False:    
-                    obs.append(np.array([x, y, speed, heading]))            
+                    x = (x / self.max_x) * 2 - 1  # Map [0, max_x] to [-1, 1]
+                    y = (y / self.max_y) * 2 - 1  # Map [0, max_y] to [-1, 1]
+                
+                # Add state to observation history
+                if self.use_drift_fea is False:
+                    obs.append(np.array([x, y, speed, heading]))
                 else:
                     obs.append(np.array([x, y, speed, heading, drift]))
-                        
-        # Pad with -1 if we don't have enough history
+        
+        # PAD END: If observation history is shorter than required, pad with zeros
+        # This happens when ship trajectory is shorter than history length
         while len(obs) < self.observation_history_length + 1:
-            obs.append(self.padded_val)        
+            obs.append(self.padded_val)
+        
         return np.array(obs)
     
     def _get_padded_observation(self):
         return [self.padded_val] * (self.observation_history_length + 1)
     
-    def infer_action_from_trajectory(self, timestep):       
+    def infer_action_from_trajectory(self, timestep):
+        """
+        Infers the action taken between two consecutive states in the recorded trajectory.
+        
+        ACTION INFERENCE PROCESS:
+        Given state at timestep t and t+1 from recorded data:
+        1. Calculate spatial displacement: dx = x[t+1] - x[t], dy = y[t+1] - y[t]
+        2. Calculate heading change: dheading = heading[t+1] - heading[t] (shortest angle)
+        3. Validate movements are within physically reasonable bounds
+        4. Calculate acceleration from speed change
+        5. Scale to action space range if needed
+        
+        Args:
+            timestep: Index of the current state in the trajectory
+            
+        Returns:
+            numpy array [dx, dy, dheading] if valid
+            None if action exceeds bounds (trajectory has erratic movements)
+        """
+        # Get consecutive states from the recorded trajectory
         current_state = self.ship_trajectories[self.ego_pos][timestep] 
         next_state = self.ship_trajectories[self.ego_pos][timestep + 1]
 
-        dx = next_state[0] - current_state[0]
-        dy = next_state[1] - current_state[1]
-        dheading = (next_state[3] - current_state[3] + np.pi) % (2 * np.pi) - np.pi  # Ensure shortest path
+        # Calculate position changes in meters
+        dx = next_state[0] - current_state[0]  # Change in x position
+        dy = next_state[1] - current_state[1]  # Change in y position
+        
+        # Calculate heading change, ensuring shortest angular path
+        # (heading[t+1] - heading[t] + π) % 2π - π maps to [-π, π] range
+        dheading = (next_state[3] - current_state[3] + np.pi) % (2 * np.pi) - np.pi
+        
+        # Track maximum displacements for validation
         self.max_dx = max(self.max_dx, abs(dx))
         if abs(dx) > 150:
-            self.count_dx.append(abs(dx))
+            self.count_dx.append(abs(dx))  # Log unusually large displacements
         self.max_dy = max(self.max_dy, abs(dy))
+        
+        # Calculate acceleration for expert behavior tracking
         if timestep == 0:
-            new_speed = np.sqrt(dx**2 + dy**2)/self.second_perts  # Example: speed as magnitude of movement            
+            # For first step, calculate speed from displacement
+            new_speed = np.sqrt(dx**2 + dy**2)/self.second_perts  # m/s
+            # Acceleration = (new_speed - initial_speed) / time_interval
             self.exp_acclerations.append((new_speed - current_state[2])/self.second_perts)
         else:
-            new_speed = np.sqrt(dx**2 + dy**2)/self.second_perts  # Example: speed as magnitude of movement            
+            # For subsequent steps, calculate from previous speed
+            new_speed = np.sqrt(dx**2 + dy**2)/self.second_perts
             prv_state = self.ship_trajectories[self.ego_pos][timestep-1]
             dx_old = current_state[0] - prv_state[0]
             dy_old = current_state[1] - prv_state[1]
-            old_speed = np.sqrt(dx_old**2 + dy_old**2)/self.second_perts  # Example: speed as magnitude of movement   
-            self.exp_acclerations.append((new_speed - old_speed)/self.second_perts)         
+            old_speed = np.sqrt(dx_old**2 + dy_old**2)/self.second_perts
+            self.exp_acclerations.append((new_speed - old_speed)/self.second_perts)
         
-        # assert(abs(dheading) <= np.pi/2)       
-        # assert(abs(dx) <= (self.max_x / 20))        
-        # assert(abs(dy) <=  (self.max_y / 20))
+        # VALIDATION: Check if movements are within acceptable bounds
+        # These bounds ensure the trajectory represents normal ship behavior
+        # Reject if: heading change > 90°, or displacement > 5% of environment size
         if abs(dheading) > np.pi/2 or abs(dx) > (self.max_x / 20) or abs(dy) >= (self.max_y / 20):
-            return None #Irregular action case return None for ignoring this scenario later
-                        
+            return None  # Irregular/erratic action - reject this trajectory
+        
+        # SCALING: Transform actions to match the action space definition
         if self.normalize_xy:
+            # For normalized observations, scale by half of max dimension
             dx = dx / (self.max_x / 2)
             dy = dy / (self.max_y / 2)        
         elif self.scale_act:
-            dx = dx / (self.max_x / 20)
-            dy = dy / (self.max_y / 20)
-            dheading = dheading / (np.pi / 2)  # Scale back to [-1, 1] range              
-        # Clip actions to ensure they're in the [-1, 1] range
+            # For scaled actions, normalize to [-1, 1] range
+            dx = dx / (self.max_x / 20)   # Max displacement is 5% of width
+            dy = dy / (self.max_y / 20)   # Max displacement is 5% of height
+            dheading = dheading / (np.pi / 2)  # Max turn is 90°
+        
+        # Construct action array
         if self.scale_act is False:
-            action = np.array([dx, dy, dheading])        
+            action = np.array([dx, dy, dheading])  # Unscaled (raw meter/radian values)
         else:
+            # Clip to [-1, 1] to ensure actions are strictly within bounds
             action = np.clip([dx, dy, dheading], -1, 1)
-        # if action[0] == -1:
-        #     print(self.max_x)
-        #     print(next_state[0] - current_state[0])
-        #     print(next_state[1] - current_state[1])
-        #     print(current_state[2], next_state[2])
-        #     assert 1 == -1
 
         return action
     
     def gen_actions_from_data(self):
+        """
+        Extracts expert actions from the recorded trajectory of the ego ship.
+        
+        EXPERT ACTION EXTRACTION PROCESS:
+        For each consecutive pair of states in the trajectory:
+        1. Calculate positional change (dx, dy) between states
+        2. Calculate heading change (dheading) between states
+        3. Validate that changes are within acceptable bounds (not erratic)
+        4. Scale actions to match the action space range
+        
+        Returns:
+            numpy array of actions [(dx, dy, dheading), ...] if valid
+            None if any action exceeds bounds (indicates erratic/invalid trajectory)
+        """
+        # Calculate trajectory length (number of transitions = states - 1)
         exp_traj_length = len(self.ship_trajectories[self.ego_pos]) - 1
         res_lst = []
+        
+        # Generate action for each transition in the recorded trajectory
         for i in range(exp_traj_length):
+            # Extract action from state transition i -> i+1
             val_a = self.infer_action_from_trajectory(i)
+            
+            # If any action is invalid (too large movements), reject entire trajectory
+            # This ensures only smooth, realistic trajectories are included in the dataset
             if val_a is None:
                 return None
+            
             res_lst.append(val_a)
+        
+        # Return as float32 array for compatibility with neural network training
         return np.array(res_lst, dtype=np.float32)
 
 TIME_COL = "TIMESTAMP_UTC"
@@ -737,46 +1041,96 @@ def radians_2d_to_heading(radians_2d):
     return normalized_degrees
 
 def chunk_to_traj(chunk: pl.DataFrame, interpol_interval: timedelta, region_of_interest_array: np.ndarray):
-    # Ensure interpol_interval is in integer seconds
+    """
+    Converts a single ship's raw AIS data chunk into a smoothed trajectory.
+    
+    TRAJECTORY GENERATION FROM RAW AIS DATA:
+    Raw AIS data contains irregular, sparse position reports. This function:
+    1. Extracts time, position, speed, heading from AIS records
+    2. Converts geographic coordinates (lat/lon) to local Cartesian (x/y in meters)
+    3. Converts speed from knots to m/s, heading from degrees to radians
+    4. Defines regular time grid aligned to interpolation interval
+    5. Interpolates positions, speed, heading onto regular time grid
+    6. Validates that trajectory fits within region of interest
+    
+    This creates smooth, regularly-sampled trajectories suitable for RL training.
+    
+    Args:
+        chunk: Polars DataFrame with 'all_records' column containing AIS position reports
+        interpol_interval: Time between trajectory samples (e.g., 10 seconds)
+        region_of_interest_array: [[lon_min, lat_min], [lon_max, lat_max]] bounds
+        
+    Returns:
+        traj: numpy array of shape (n_timesteps, 4) with [x, y, speed, heading]
+        t_np: numpy array of Unix timestamps corresponding to each state
+        (None, None) if trajectory is too short or invalid
+    """
+    # Ensure interpolation interval is in integer seconds for alignment
     interpol_seconds = int(interpol_interval.total_seconds())
     if interpol_seconds != interpol_interval.total_seconds():
         raise ValueError("interpol_interval must be in integer seconds")
 
-    # Extract time, latitude, and longitude from the 'all_records' column
-    # and create a new DataFrame with only these columns
+    # EXTRACT RAW DATA: Explode nested 'all_records' structure into flat DataFrame
+    # Each row contains: timestamp, latitude, longitude, speed (10x knots), heading (degrees)
     df = chunk.select([
         pl.col('all_records').list.eval(pl.element().struct.field(TIME_COL)).alias('time'),
         pl.col('all_records').list.eval(pl.element().struct.field('LAT')).alias('lat'),
         pl.col('all_records').list.eval(pl.element().struct.field('LON')).alias('lon'),
         pl.col('all_records').list.eval(pl.element().struct.field('SPEED_KNOTSX10')).alias('speed'),
         pl.col('all_records').list.eval(pl.element().struct.field('HEADING')).alias('heading'),
-    ]).explode(['time', 'lat', 'lon', 'speed', 'heading'])     
-    # Find the start and end times, rounded to the nearest interpol_interval
-    # start_time will uses ceil and end_time uses floor due to interpolation
+    ]).explode(['time', 'lat', 'lon', 'speed', 'heading'])
+    
+    # DEFINE TIME GRID: Align start and end times to interpolation interval boundaries
+    # start_time uses ceil: round up to next interval boundary
     start_time = df['time'].min().replace(microsecond=0)
-    start_time = start_time + timedelta(seconds=interpol_seconds - start_time.second % interpol_seconds)            
+    offset = (interpol_seconds - (start_time.second % interpol_seconds)) % interpol_seconds
+    start_time = start_time + timedelta(seconds=offset)
+    
+    # end_time uses floor: round down to previous interval boundary
     end_time = df['time'].max().replace(microsecond=0)
-    end_time = end_time - timedelta(seconds=end_time.second % interpol_seconds)    
+    end_time = end_time - timedelta(seconds=end_time.second % interpol_seconds)
 
-    # Convert times to seconds since epoch (integer)
-    original_time = df['time'].map_elements(lambda x: int(x.timestamp()), return_dtype=pl.Int64)        
+    # Validate time window is sufficient
+    # After rounding to interpolation boundaries, we need at least one valid interval
+    if start_time > end_time:
+        # This happens when the chunk's time span is shorter than the interpolation interval
+        # Example: chunk spans 12:34:52 to 12:34:57 (5 seconds)
+        #   → start_time rounds to 12:35:00, end_time rounds to 12:34:50
+        #   → start_time > end_time (invalid!)
+        return None, None  # Trajectory too short for interpolation
 
-    # Define the origin as the southwest corner of the region of interest
+    # Convert times to Unix timestamps (seconds since epoch) for numerical interpolation
+    original_time = df['time'].map_elements(lambda x: int(x.timestamp()), return_dtype=pl.Int64)
+
+    # DEFINE ORIGIN: Southwest corner of region becomes (0, 0) in local coordinates
     origin_lon, origin_lat = region_of_interest_array[0][0], region_of_interest_array[0][1]
     
-    # Convert to numpy arrays for interpolation
+    # COORDINATE CONVERSION: Geographic (lat/lon) -> Cartesian (x/y meters)
     original_time_np = original_time.to_numpy()
+    # Convert latitudes to y positions using Haversine distance
     y_np = np.apply_along_axis(lambda x: lat_to_ypos(x, origin_lon, origin_lat), 0, df['lat'].to_numpy())
+    # Convert longitudes to x positions using Haversine distance
     x_np = np.apply_along_axis(lambda x: lon_to_xpos(x, origin_lon, origin_lat), 0, df['lon'].to_numpy())
+    # Convert speed from 10x knots to meters/second
     speed_np = np.apply_along_axis(knots_to_ms, 0, df['speed'].to_numpy())
-    heading_np = np.apply_along_axis(heading_to_2d_radians, 0, df['heading'].to_numpy())    
+    # Convert heading from compass degrees to 2D radians (math convention)
+    heading_np = np.apply_along_axis(heading_to_2d_radians, 0, df['heading'].to_numpy())
+    
+    # CREATE REGULAR TIME GRID: Evenly spaced timestamps at interpolation interval
     t_np = np.arange(start_time.timestamp(), end_time.timestamp() + interpol_seconds, interpol_seconds, dtype=np.int64)
-    traj_y = np.interp(t_np, original_time_np, y_np)    
-    traj_x = np.interp(t_np, original_time_np, x_np)            
+    
+    # INTERPOLATION: Sample trajectory at regular intervals
+    # Linear interpolation for x, y, speed (continuous quantities)
+    traj_y = np.interp(t_np, original_time_np, y_np)
+    traj_x = np.interp(t_np, original_time_np, x_np)
     traj_speed = np.interp(t_np, original_time_np, speed_np)
+    # Angular interpolation for heading (handles wraparound at 0/2π)
     traj_heading = utils.shortest_path_angle_interp(t_np, original_time_np, heading_np)
-    traj = np.column_stack((traj_x, traj_y, traj_speed, traj_heading))    
-    traj = traj.astype(np.float32)    
+    
+    # ASSEMBLE TRAJECTORY: Stack into single array [x, y, speed, heading]
+    traj = np.column_stack((traj_x, traj_y, traj_speed, traj_heading))
+    traj = traj.astype(np.float32)  # Use float32 for memory efficiency
+    
     return traj, t_np
 
 def find_max_overlap_with_ego(df: pl.DataFrame, ego_id: int, n: int) -> pl.DataFrame:
@@ -855,20 +1209,92 @@ def read_position_data(file_pattern):
 
 
 def create_minari_dataset(env, dataset_name, num_ships):
-    env = minari.DataCollector(env, action_space=env.action_space, observation_space=env.observation_space)         
-    for id_ego in range(num_ships):   
-        print(id_ego) 
-        obs, info = env.reset(seed=42, options = {'ego_pos': id_ego})
-        # print(obs['time'])
+    """
+    Creates a Minari dataset containing ship navigation episodes extracted from real AIS trajectory data.
+    
+    EPISODE GENERATION PROCESS:
+    Each episode represents one ship's complete trajectory from start to goal position.
+    The ego ship follows its expert trajectory from the data while observing neighboring ships.
+    
+    Episodes are recorded until termination/truncation, and actions are automatically
+    truncated to match the actual episode length (no pre-validation needed).
+    
+    Args:
+        env: The ship environment containing all preprocessed trajectories
+        dataset_name: Name for the Minari dataset to be created
+        num_ships: Total number of ship trajectories available in the environment
+    """
+    
+    # PRE-FILTER: Check which trajectories will produce useful episodes
+    # Skip trajectories that are too short or will terminate immediately
+    print("Pre-filtering trajectories...")
+    min_episode_length = 5  # Minimum number of steps for useful learning data
+    valid_episodes = []
+    
+    # Get the base environment (unwrapped if it's wrapped)
+    base_env = env.unwrapped if hasattr(env, 'unwrapped') else env
+    
+    for id_ego in range(num_ships):
+        # Do a dry run to check episode viability (without DataCollector)
+        obs, info = base_env.reset(seed=42, options={'ego_pos': id_ego})
         actions = info['actions']
-        if actions is None: #Irregular action case
+        
+        if actions is None:
+            print(f"Episode {id_ego}: SKIP (invalid actions)")
             continue
-        for i in range(1000):        
+        
+        # Simulate to see how many steps it actually takes
+        steps_taken = 0
+        for i in range(len(actions)):
             action = actions[i]
-            observation, reward, terminated, truncated, info = env.step(action)                         
-            if terminated or truncated:          
+            observation, reward, terminated, truncated, info = base_env.step(action)
+            steps_taken += 1
+            if terminated or truncated:
                 break
+        
+        # Only include episodes with sufficient length
+        if steps_taken >= min_episode_length:
+            valid_episodes.append((id_ego, steps_taken, len(actions)))
+            print(f"Episode {id_ego}: VALID ({steps_taken}/{len(actions)} steps)")
+        else:
+            print(f"Episode {id_ego}: SKIP (only {steps_taken} steps, min={min_episode_length})")
+    
+    print(f"\nFound {len(valid_episodes)} valid episodes out of {num_ships}")
+    print(f"{'='*60}\n")
+    
+    # Wrap environment with DataCollector NOW, after filtering
+    # Pass the original environment (not unwrapped) so env_spec is preserved
+    env = minari.DataCollector(env, action_space=base_env.action_space, observation_space=base_env.observation_space)
+    
+    # Collect only the validated episodes
+    episodes_collected = 0
+    for id_ego, expected_steps, total_actions in valid_episodes:   
+        print(f"Collecting episode {id_ego} ({expected_steps}/{total_actions} steps)...", end=" ")
+        
+        # Reset and collect this validated episode
+        obs, info = env.reset(seed=42, options={'ego_pos': id_ego})
+        actions = info['actions']
+        
+        # Execute the episode (we know it will complete successfully from pre-check)
+        for i in range(len(actions)):        
+            action = actions[i]
+            observation, reward, terminated, truncated, info = env.step(action)
+            
+            if terminated or truncated:
+                break
+        
+        print("RECORDED")
+        episodes_collected += 1
+    
+    print(f"\n{'='*60}")
+    print(f"Dataset collection complete!")
+    print(f"Episodes recorded: {episodes_collected}")
+    print(f"Episodes skipped: {num_ships - episodes_collected} (invalid or too short)")
+    print(f"Total processed: {num_ships}")
+    print(f"{'='*60}\n")
+    
+    # Create and save the final Minari dataset with all collected episodes
     dataset = env.create_dataset(dataset_id=dataset_name,                                                            
-                                author="qapham",
-                                author_email="lovek62uet@gmail.com")
+                                author="jjvandenbroek",
+                                author_email="jasperjvandenbroek@gmail.com")
 

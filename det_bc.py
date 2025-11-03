@@ -441,6 +441,9 @@ class BCLogger:
 def reconstruct_policy(
     policy_path: str,
     device: Union[th.device, str] = "auto",
+    observation_space: Optional[gym.Space] = None,
+    action_space: Optional[gym.Space] = None,
+    net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
 ) -> DetPolicy:
     """Reconstruct a saved policy.
 
@@ -451,9 +454,43 @@ def reconstruct_policy(
     Returns:
         policy: policy with reloaded weights.
     """
-    policy = th.load(policy_path, map_location=utils.get_device(device))
-    assert isinstance(policy, DetPolicy)
-    return policy
+    try:
+        policy = th.load(policy_path, map_location=utils.get_device(device))
+        if isinstance(policy, DetPolicy):
+            return policy
+    except Exception as e:
+        # Catch unpickling errors for weights-only files and fall through to state_dict load
+        err_msg = str(e)
+        if "Weights only load failed" not in err_msg and not isinstance(e, (RuntimeError, RuntimeError)):
+            raise
+
+    # At this point assume the file contains a state_dict (weights-only).
+    if observation_space is None or action_space is None:
+        raise ValueError(
+            "Checkpoint appears to be weights-only. You must supply `observation_space` and `action_space` to reconstruct the policy architecture before loading weights."
+        )
+
+    # Build policy skeleton and load state dict
+    # Try to infer net_arch if available, otherwise use default
+    policy = DetPolicy(
+        observation_space=observation_space,
+        action_space=action_space,
+        net_arch=net_arch,
+    )
+    policy.to(utils.get_device(device))
+
+    # Load state dict
+    state = th.load(policy_path, map_location=utils.get_device(device))
+    if isinstance(state, dict):
+        # If the file contains a dict with a 'model_state_dict' or similar common keys, try to extract
+        if "model_state_dict" in state:
+            state_dict = state["model_state_dict"]
+        else:
+            state_dict = state
+        policy.load_state_dict(state_dict)
+        return policy
+
+    raise RuntimeError("Failed to reconstruct policy from checkpoint: unknown file format.")
 
 
 class BC(algo_base.DemonstrationAlgorithm):
